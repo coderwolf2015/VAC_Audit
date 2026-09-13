@@ -8,6 +8,7 @@
 #   - It processes Security EVTX files one at a time.
 #   - Per-log WFP work uses atomic .partial -> final output and .done checkpoints.
 #   - Re-running the same command automatically resumes completed work.
+#   - Per-log timing/throughput is recorded so long EVTX runs can be estimated safely.
 #
 # Frozen VAC observation window:
 #   2026-09-05 14:00:00 through 2026-09-10 13:25:00
@@ -162,6 +163,7 @@ function Remove-StageOutputs([string]$Name) {
         }
         'WFP' {
             Get-ChildItem -LiteralPath $WfpDir -File -ErrorAction SilentlyContinue | Remove-Item -Force
+            Remove-Item -LiteralPath (Join-Path $OutReports 'WFP-PerLog-Timing.csv') -Force -ErrorAction SilentlyContinue
         }
         'Merge' {
             Get-ChildItem -LiteralPath $OutReports -File -Filter 'WFP-*' -ErrorAction SilentlyContinue |
@@ -285,6 +287,7 @@ if (Should-RunStage 'WFP') {
     $logs = @(Get-ChildItem -LiteralPath $Raw -File -Filter 'Security-*.evtx' | Sort-Object Name)
     if ($logs.Count -eq 0) { throw 'No Security-*.evtx files found in RawLogs.' }
 
+    $timingPath = Join-Path $OutReports 'WFP-PerLog-Timing.csv'
     $index = 0
     foreach ($log in $logs) {
         $index++
@@ -303,7 +306,11 @@ if (Should-RunStage 'WFP') {
         Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $empty -Force -ErrorAction SilentlyContinue
 
-        Write-Host "`n[$index/$($logs.Count)] Processing $($log.Name) ($([math]::Round($log.Length/1GB,2)) GB)" -ForegroundColor Cyan
+        $started = Get-Date
+        $sizeGiB = [math]::Round($log.Length / 1GB, 3)
+        Write-Host "`n[$index/$($logs.Count)] Processing $($log.Name)" -ForegroundColor Cyan
+        Write-Host "      Size    : $sizeGiB GiB ($($log.Length) bytes)"
+        Write-Host "      Started : $($started.ToString('yyyy-MM-dd HH:mm:ss'))"
         $count = 0
         $sw = [Diagnostics.Stopwatch]::StartNew()
 
@@ -312,7 +319,7 @@ if (Should-RunStage 'WFP') {
                 ForEach-Object {
                     $count++
                     if (($count % 10000) -eq 0) {
-                        Write-Host "  ... $count WFP events converted ($([math]::Round($sw.Elapsed.TotalMinutes,1)) min)"
+                        Write-Host "      ... $count WFP events converted; elapsed $($sw.Elapsed.ToString('hh\:mm\:ss'))"
                     }
                     Convert-WfpEvent -Event $_ -SourceLog $log.Name
                 } |
@@ -325,19 +332,50 @@ if (Should-RunStage 'WFP') {
                 "No 5152/5157 events in frozen window." | Set-Content -Encoding UTF8 -LiteralPath $empty
             }
 
+            $sw.Stop()
+            $finished = Get-Date
+            $elapsedText = $sw.Elapsed.ToString('hh\:mm\:ss\.fff')
+            $throughputMiBs = if ($sw.Elapsed.TotalSeconds -gt 0) { [math]::Round(($log.Length / 1MB) / $sw.Elapsed.TotalSeconds, 2) } else { 0 }
+
             @(
                 "Log=$($log.Name)"
-                "Completed=$((Get-Date).ToString('o'))"
+                "LengthBytes=$($log.Length)"
+                "Started=$($started.ToString('o'))"
+                "Completed=$($finished.ToString('o'))"
                 "Events=$count"
+                "Elapsed=$elapsedText"
                 "ElapsedSeconds=$([math]::Round($sw.Elapsed.TotalSeconds,3))"
+                "ApproxSourceMiBPerSecond=$throughputMiBs"
             ) | Set-Content -Encoding UTF8 -LiteralPath $done
-            $sw.Stop()
-            Write-Checkpoint "$($log.Name): $count events; $([math]::Round($sw.Elapsed.TotalMinutes,2)) min"
+
+            $timingRow = [pscustomobject]@{
+                Log = $log.Name
+                LengthBytes = $log.Length
+                SizeGiB = $sizeGiB
+                Started = $started.ToString('o')
+                Finished = $finished.ToString('o')
+                Elapsed = $elapsedText
+                ElapsedSeconds = [math]::Round($sw.Elapsed.TotalSeconds,3)
+                WfpEvents = $count
+                ApproxSourceMiBPerSecond = $throughputMiBs
+            }
+            if (Test-Path -LiteralPath $timingPath) {
+                $timingRow | Export-Csv -NoTypeInformation -Encoding UTF8 -Append -LiteralPath $timingPath
+            } else {
+                $timingRow | Export-Csv -NoTypeInformation -Encoding UTF8 -LiteralPath $timingPath
+            }
+
+            Write-Host "      Finished: $($finished.ToString('yyyy-MM-dd HH:mm:ss'))"
+            Write-Host "      Elapsed : $elapsedText"
+            Write-Host "      Events  : $count"
+            Write-Host "      Rate    : ~$throughputMiBs MiB/s of source EVTX"
+            Write-Checkpoint "$($log.Name) complete; checkpoint saved"
         } catch {
             $sw.Stop()
+            $failed = Get-Date
             Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
             $_ | Out-String | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $WfpDir ($base + '.error.txt'))
-            Write-Review "$($log.Name) failed after $([math]::Round($sw.Elapsed.TotalMinutes,2)) min. No .done marker written; next run retries this log."
+            Write-Review "$($log.Name) failed at $($failed.ToString('yyyy-MM-dd HH:mm:ss')) after $($sw.Elapsed.ToString('hh\:mm\:ss\.fff')). No .done marker written; next run retries this log."
             throw
         }
     }
